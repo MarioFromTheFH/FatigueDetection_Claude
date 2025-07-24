@@ -21,6 +21,15 @@ except ImportError:
     print("FER library not installed. Install with: pip install fer")
     sys.exit(1)
 
+try:
+    import dlib
+    import face_recognition
+    EYE_DETECTION_AVAILABLE = True
+except ImportError:
+    print("Eye detection libraries not available. Install with: pip install dlib face-recognition")
+    print("Eye opening detection will be disabled.")
+    EYE_DETECTION_AVAILABLE = False
+
 class MentalFatigueDetector:
     def __init__(self, root):
         self.root = root
@@ -40,6 +49,14 @@ class MentalFatigueDetector:
         # Mental fatigue calculation
         self.emotion_history = deque(maxlen=30)  # Store last 30 emotion readings
         self.fatigue_score = 0.0
+        self.eye_openness_history = deque(maxlen=15)  # Store eye openness readings
+        self.detected_faces_count = 0
+        
+        # Eye detection setup
+        if EYE_DETECTION_AVAILABLE:
+            self.face_landmarks_predictor = dlib.shape_predictor(self.get_landmarks_model())
+        else:
+            self.face_landmarks_predictor = None
         
         # Threading
         self.video_thread = None
@@ -160,7 +177,7 @@ class MentalFatigueDetector:
         
         tk.Label(
             emotions_frame,
-            text="Current Emotions:",
+            text="Detection Results:",
             font=("Arial", 12, "bold"),
             bg='#2c3e50',
             fg='white'
@@ -168,8 +185,8 @@ class MentalFatigueDetector:
         
         self.emotions_text = tk.Text(
             emotions_frame,
-            height=4,
-            width=60,
+            height=6,
+            width=70,
             bg='#34495e',
             fg='white',
             font=("Arial", 10)
@@ -219,7 +236,7 @@ class MentalFatigueDetector:
             file_path = filedialog.askopenfilename(
                 title="Select Video File",
                 filetypes=[
-                    ("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv"),
+                    ("Video files", "*.mp4 *.MP4 *.avi *.AVI *.mov *.MOV *.mkv *.MKV *.wmv *.WMV"),
                     ("All files", "*.*")
                 ]
             )
@@ -228,52 +245,192 @@ class MentalFatigueDetector:
             else:
                 self.source_var.set("Webcam")
                 self.video_source = 0
+    
+    def get_landmarks_model(self):
+        """Download and return path to facial landmarks model"""
+        import urllib.request
+        import os
+        
+        model_path = "shape_predictor_68_face_landmarks.dat"
+        
+        if not os.path.exists(model_path):
+            print("Downloading facial landmarks model (this may take a while)...")
+            url = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+            try:
+                urllib.request.urlretrieve(url, "shape_predictor_68_face_landmarks.dat.bz2")
+                
+                # Extract bz2 file
+                import bz2
+                with bz2.BZ2File("shape_predictor_68_face_landmarks.dat.bz2", 'rb') as f:
+                    with open(model_path, 'wb') as out_file:
+                        out_file.write(f.read())
+                
+                # Clean up
+                os.remove("shape_predictor_68_face_landmarks.dat.bz2")
+                print("Model downloaded successfully!")
+                
+            except Exception as e:
+                print(f"Failed to download landmarks model: {e}")
+                print("Eye detection will be disabled.")
+                return None
+        
+        return model_path
+    
+    def calculate_eye_aspect_ratio(self, eye_points):
+        """Calculate Eye Aspect Ratio (EAR) to determine eye openness"""
+        # Compute the euclidean distances between the two sets of
+        # vertical eye landmarks (x, y)-coordinates
+        A = np.linalg.norm(eye_points[1] - eye_points[5])
+        B = np.linalg.norm(eye_points[2] - eye_points[4])
+        
+        # Compute the euclidean distance between the horizontal
+        # eye landmark (x, y)-coordinates
+        C = np.linalg.norm(eye_points[0] - eye_points[3])
+        
+        # Compute the eye aspect ratio
+        ear = (A + B) / (2.0 * C)
+        return ear
+    
+    def get_eye_openness(self, frame, face_locations):
+        """Calculate average eye openness for all detected faces"""
+        if not EYE_DETECTION_AVAILABLE or not self.face_landmarks_predictor:
+            return None
+        
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            eye_openness_scores = []
+            
+            for face_location in face_locations:
+                # Convert face_recognition format to dlib format
+                top, right, bottom, left = face_location
+                dlib_rect = dlib.rectangle(left, top, right, bottom)
+                
+                # Get facial landmarks
+                landmarks = self.face_landmarks_predictor(gray, dlib_rect)
+                
+                # Extract left and right eye coordinates
+                left_eye = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(36, 42)])
+                right_eye = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(42, 48)])
+                
+                # Calculate eye aspect ratio for both eyes
+                left_ear = self.calculate_eye_aspect_ratio(left_eye)
+                right_ear = self.calculate_eye_aspect_ratio(right_eye)
+                
+                # Average the eye aspect ratio together for both eyes
+                avg_ear = (left_ear + right_ear) / 2.0
+                
+                # Convert EAR to eye openness percentage (normalized)
+                # EAR typically ranges from ~0.15 (closed) to ~0.35 (wide open)
+                eye_openness = min(max((avg_ear - 0.15) / (0.35 - 0.15), 0), 1) * 100
+                eye_openness_scores.append(eye_openness)
+            
+            return np.mean(eye_openness_scores) if eye_openness_scores else None
+            
+        except Exception as e:
+            print(f"Error calculating eye openness: {e}")
+            return None
         else:
             self.video_source = 0
     
-    def calculate_mental_fatigue(self, emotions):
+    def calculate_mental_fatigue(self, all_emotions_data, eye_openness=None):
         """
-        Calculate mental fatigue based on emotion scores
+        Calculate mental fatigue based on emotion scores from all detected faces
         Combines boredom (neutral + sad) and tiredness indicators
+        Now includes eye openness as a fatigue indicator
         """
-        if not emotions:
-            return 0.0
+        if not all_emotions_data:
+            return 0.0, 0
         
-        # Extract emotion scores
-        neutral = emotions.get('neutral', 0)
-        sad = emotions.get('sad', 0)
-        angry = emotions.get('angry', 0)
-        fear = emotions.get('fear', 0)
-        happy = emotions.get('happy', 0)
+        face_fatigue_scores = []
         
-        # Calculate fatigue components
-        # Boredom: high neutral, low happy
-        boredom_score = neutral * (1 - happy)
+        # Calculate fatigue for each detected face
+        for emotions in all_emotions_data:
+            # Extract emotion scores
+            neutral = emotions.get('neutral', 0)
+            sad = emotions.get('sad', 0)
+            angry = emotions.get('angry', 0)
+            fear = emotions.get('fear', 0)
+            happy = emotions.get('happy', 0)
+            
+            # Calculate fatigue components
+            # Boredom: high neutral, low happy
+            boredom_score = neutral * (1 - happy)
+            
+            # Tiredness: combination of sad, angry, and fear (stress indicators)
+            tiredness_score = (sad + angry + fear) / 3
+            
+            # Combined emotional fatigue (weighted average)
+            emotional_fatigue = (boredom_score * 0.6 + tiredness_score * 0.4)
+            
+            face_fatigue_scores.append(emotional_fatigue)
         
-        # Tiredness: combination of sad, angry, and fear (stress indicators)
-        tiredness_score = (sad + angry + fear) / 3
+        # Average fatigue across all faces
+        avg_emotional_fatigue = np.mean(face_fatigue_scores)
         
-        # Combined mental fatigue (weighted average)
-        mental_fatigue = (boredom_score * 0.6 + tiredness_score * 0.4)
+        # Incorporate eye openness if available
+        if eye_openness is not None:
+            # Store eye openness history
+            self.eye_openness_history.append(eye_openness)
+            
+            # Calculate smoothed eye openness
+            if len(self.eye_openness_history) > 3:
+                smoothed_eye_openness = np.mean(list(self.eye_openness_history)[-5:])
+            else:
+                smoothed_eye_openness = eye_openness
+            
+            # Convert eye openness to fatigue indicator
+            # Lower eye openness = higher fatigue
+            eye_fatigue = (100 - smoothed_eye_openness) / 100
+            
+            # Combine emotional fatigue with eye fatigue
+            # Weight: 70% emotions, 30% eye openness
+            combined_fatigue = (avg_emotional_fatigue * 0.7 + eye_fatigue * 0.3)
+        else:
+            combined_fatigue = avg_emotional_fatigue
         
         # Normalize to 0-100 scale
-        return min(mental_fatigue * 100, 100)
+        fatigue_percentage = min(combined_fatigue * 100, 100)
+        
+        return fatigue_percentage, len(all_emotions_data)
     
     def process_frame(self, frame):
-        """Process frame for emotion detection"""
+        """Process frame for emotion detection and eye openness analysis"""
         try:
-            # Detect emotions
-            result = self.detector.detect_emotions(frame)
+            # Detect emotions for all faces
+            emotion_results = self.detector.detect_emotions(frame)
             
-            if result:
-                # Get the face with highest confidence
-                face_data = max(result, key=lambda x: max(x['emotions'].values()))
-                emotions = face_data['emotions']
-                box = face_data['box']
+            if emotion_results:
+                # Extract all emotions and face locations
+                all_emotions = []
+                face_locations = []
                 
-                # Calculate mental fatigue
-                fatigue = self.calculate_mental_fatigue(emotions)
+                # Draw bounding boxes and collect data
+                for face_data in emotion_results:
+                    emotions = face_data['emotions']
+                    box = face_data['box']
+                    
+                    all_emotions.append(emotions)
+                    
+                    # Convert box format for face_recognition library
+                    x, y, w, h = box
+                    face_locations.append((y, x + w, y + h, x))  # top, right, bottom, left
+                    
+                    # Draw bounding box
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    
+                    # Add individual face emotion info
+                    dominant_emotion = max(emotions, key=emotions.get)
+                    confidence = emotions[dominant_emotion]
+                    cv2.putText(frame, f"{dominant_emotion}: {confidence:.2f}", 
+                               (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                # Calculate eye openness for all faces
+                eye_openness = self.get_eye_openness(frame, face_locations)
+                
+                # Calculate mental fatigue for all detected faces
+                fatigue, face_count = self.calculate_mental_fatigue(all_emotions, eye_openness)
                 self.emotion_history.append(fatigue)
+                self.detected_faces_count = face_count
                 
                 # Smooth fatigue score using moving average
                 if len(self.emotion_history) > 5:
@@ -281,38 +438,75 @@ class MentalFatigueDetector:
                 else:
                     self.fatigue_score = fatigue
                 
-                # Draw bounding box on frame
-                x, y, w, h = box
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                # Add overall fatigue text to frame
+                fatigue_text = f"Avg Fatigue: {self.fatigue_score:.1f}% ({face_count} faces)"
+                cv2.putText(frame, fatigue_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 
-                # Add emotion text
-                emotion_text = f"Fatigue: {self.fatigue_score:.1f}%"
-                cv2.putText(frame, emotion_text, (x, y - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                if eye_openness is not None:
+                    eye_text = f"Avg Eye Openness: {eye_openness:.1f}%"
+                    cv2.putText(frame, eye_text, (10, 60), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                 
                 # Update GUI in main thread
-                self.root.after(0, self.update_gui, emotions)
+                self.root.after(0, self.update_gui, all_emotions, eye_openness)
+            else:
+                # No faces detected
+                self.detected_faces_count = 0
+                cv2.putText(frame, "No faces detected", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 
         except Exception as e:
             print(f"Error processing frame: {e}")
         
         return frame
     
-    def update_gui(self, emotions):
-        """Update GUI elements with current emotion data"""
+    def update_gui(self, all_emotions, eye_openness=None):
+        """Update GUI elements with current emotion data from all faces"""
         # Update fatigue level
         fatigue_percent = int(self.fatigue_score)
-        self.fatigue_label.config(text=f"Mental Fatigue Level: {fatigue_percent}%")
+        faces_text = "face" if self.detected_faces_count == 1 else "faces"
+        self.fatigue_label.config(
+            text=f"Mental Fatigue Level: {fatigue_percent}% ({self.detected_faces_count} {faces_text})"
+        )
         self.fatigue_progress['value'] = fatigue_percent
         self.update_progress_bar_color(fatigue_percent)
         
         # Update emotions display
         self.emotions_text.delete(1.0, tk.END)
-        emotions_str = "Detected Emotions:\n"
-        for emotion, score in emotions.items():
-            emotions_str += f"{emotion.capitalize()}: {score:.3f}\n"
-        emotions_str += f"\nCalculated Mental Fatigue: {self.fatigue_score:.1f}%"
-        self.emotions_text.insert(tk.END, emotions_str)
+        
+        if self.detected_faces_count == 0:
+            self.emotions_text.insert(tk.END, "No faces detected in current frame")
+        else:
+            results_str = f"Detected {self.detected_faces_count} face(s):\n\n"
+            
+            # Show average emotions across all faces
+            if all_emotions:
+                avg_emotions = {}
+                for emotion in ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']:
+                    avg_emotions[emotion] = np.mean([face_emotions.get(emotion, 0) for face_emotions in all_emotions])
+                
+                results_str += "Average Emotions Across All Faces:\n"
+                for emotion, score in avg_emotions.items():
+                    results_str += f"  {emotion.capitalize()}: {score:.3f}\n"
+                
+                results_str += f"\nCalculated Mental Fatigue: {self.fatigue_score:.1f}%\n"
+                
+                if eye_openness is not None:
+                    results_str += f"Average Eye Openness: {eye_openness:.1f}%\n"
+                    if eye_openness < 30:
+                        results_str += "⚠️ Very low eye openness detected - high fatigue indicator\n"
+                    elif eye_openness < 50:
+                        results_str += "⚠️ Low eye openness detected - moderate fatigue indicator\n"
+                
+                # Show individual face details if multiple faces
+                if len(all_emotions) > 1:
+                    results_str += f"\nIndividual Face Details:\n"
+                    for i, emotions in enumerate(all_emotions, 1):
+                        dominant = max(emotions, key=emotions.get)
+                        results_str += f"  Face {i}: {dominant} ({emotions[dominant]:.3f})\n"
+            
+            self.emotions_text.insert(tk.END, results_str)
     
     def video_capture_loop(self):
         """Main video capture and processing loop"""
@@ -321,8 +515,13 @@ class MentalFatigueDetector:
                 ret, frame = self.cap.read()
                 if not ret:
                     if isinstance(self.video_source, str):  # Video file ended
-                        break
-                    continue
+                        print("Video file ended or cannot be read")
+                        # Reset video to beginning for continuous playback
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    else:
+                        print("Failed to read from webcam")
+                        continue
                 
                 # Flip frame for webcam (mirror effect)
                 if self.video_source == 0:
@@ -412,27 +611,44 @@ class MentalFatigueDetector:
 def main():
     """Main application entry point"""
     # Check for required libraries
-    required_libs = ['cv2', 'PIL', 'fer', 'numpy']
-    missing_libs = []
+    required_libs = [
+        ('cv2', 'opencv-python'),
+        ('PIL', 'Pillow'), 
+        ('fer', 'fer'),
+        ('numpy', 'numpy')
+    ]
     
-    for lib in required_libs:
+    optional_libs = [
+        ('dlib', 'dlib'),
+        ('face_recognition', 'face-recognition')
+    ]
+    
+    missing_libs = []
+    missing_optional = []
+    
+    for lib, install_name in required_libs:
         try:
             __import__(lib)
         except ImportError:
-            missing_libs.append(lib)
+            missing_libs.append((lib, install_name))
+    
+    for lib, install_name in optional_libs:
+        try:
+            __import__(lib)
+        except ImportError:
+            missing_optional.append((lib, install_name))
     
     if missing_libs:
         print("Missing required libraries:")
-        for lib in missing_libs:
-            if lib == 'cv2':
-                print("  Install OpenCV: pip install opencv-python")
-            elif lib == 'PIL':
-                print("  Install Pillow: pip install Pillow")
-            elif lib == 'fer':
-                print("  Install FER: pip install fer")
-            elif lib == 'numpy':
-                print("  Install NumPy: pip install numpy")
+        for lib, install_name in missing_libs:
+            print(f"  Install {lib}: pip install {install_name}")
         sys.exit(1)
+    
+    if missing_optional:
+        print("Missing optional libraries (eye detection will be disabled):")
+        for lib, install_name in missing_optional:
+            print(f"  Install {lib}: pip install {install_name}")
+        print("The application will still work without eye detection.\n")
     
     # Create and run application
     root = tk.Tk()
