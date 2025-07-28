@@ -14,6 +14,8 @@ import time
 from collections import deque
 import sys
 import os
+import csv
+from datetime import datetime
 
 try:
     from fer import FER
@@ -51,6 +53,14 @@ class MentalFatigueDetector:
         self.fatigue_score = 0.0
         self.eye_openness_history = deque(maxlen=15)  # Store eye openness readings
         self.detected_faces_count = 0
+        self.detected_screens_count = 0
+        
+        # CSV logging
+        self.start_time = None
+        self.csv_filename = None
+        self.csv_writer = None
+        self.csv_file = None
+        self.logging_enabled = False
         
         # Eye detection setup
         if EYE_DETECTION_AVAILABLE:
@@ -131,6 +141,39 @@ class MentalFatigueDetector:
             state=tk.DISABLED
         )
         self.stop_button.pack(pady=2)
+        
+        # CSV logging controls
+        csv_frame = tk.Frame(control_frame, bg='#2c3e50')
+        csv_frame.pack(side=tk.LEFT, padx=20)
+        
+        tk.Label(
+            csv_frame,
+            text="Data Logging:",
+            font=("Arial", 10, "bold"),
+            bg='#2c3e50',
+            fg='white'
+        ).pack()
+        
+        self.logging_var = tk.BooleanVar(value=True)
+        self.logging_checkbox = tk.Checkbutton(
+            csv_frame,
+            text="Enable CSV Logging",
+            variable=self.logging_var,
+            bg='#2c3e50',
+            fg='white',
+            selectcolor='#34495e',
+            font=("Arial", 10)
+        )
+        self.logging_checkbox.pack()
+        
+        self.csv_status_label = tk.Label(
+            csv_frame,
+            text="Not logging",
+            font=("Arial", 9),
+            bg='#2c3e50',
+            fg='#95a5a6'
+        )
+        self.csv_status_label.pack()
         
         # Video display frame
         video_frame = tk.Frame(self.root, bg='#34495e', relief=tk.RAISED, bd=2)
@@ -329,6 +372,178 @@ class MentalFatigueDetector:
         except Exception as e:
             print(f"Error calculating eye openness: {e}")
             return None
+    
+    def detect_glowing_objects(self, frame):
+        """Detect bright/glowing objects like phone or laptop screens"""
+        try:
+            # Convert to grayscale for brightness analysis
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Apply Gaussian blur to reduce noise
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            # Threshold for bright objects (adjust based on lighting conditions)
+            # Use adaptive threshold to handle varying lighting
+            adaptive_thresh = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, -10
+            )
+            
+            # Also use a fixed high threshold for very bright objects
+            _, bright_thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            
+            # Combine both thresholding methods
+            combined_thresh = cv2.bitwise_or(adaptive_thresh, bright_thresh)
+            
+            # Morphological operations to clean up the image
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            combined_thresh = cv2.morphologyEx(combined_thresh, cv2.MORPH_CLOSE, kernel)
+            combined_thresh = cv2.morphologyEx(combined_thresh, cv2.MORPH_OPEN, kernel)
+            
+            # Find contours of bright objects
+            contours, _ = cv2.findContours(combined_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            screen_objects = []
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                
+                # Filter by area (screens should be reasonably large)
+                if 500 < area < 50000:  # Adjust these values based on your needs
+                    # Get bounding rectangle
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Filter by aspect ratio (screens are usually rectangular)
+                    aspect_ratio = w / h
+                    if 0.3 < aspect_ratio < 4.0:  # Allow various screen orientations
+                        
+                        # Check if the region is actually bright enough
+                        roi = gray[y:y+h, x:x+w]
+                        mean_brightness = np.mean(roi)
+                        
+                        if mean_brightness > 120:  # Brightness threshold
+                            screen_objects.append({
+                                'bbox': (x, y, w, h),
+                                'area': area,
+                                'brightness': mean_brightness,
+                                'aspect_ratio': aspect_ratio
+                            })
+            
+            # Sort by area (larger objects first) and limit to most significant ones
+            screen_objects.sort(key=lambda x: x['area'], reverse=True)
+            screen_objects = screen_objects[:10]  # Max 10 objects to avoid clutter
+            
+            return screen_objects
+            
+        except Exception as e:
+            print(f"Error detecting glowing objects: {e}")
+            return []
+    
+    def setup_csv_logging(self):
+        """Setup CSV file for data logging"""
+        if not self.logging_var.get():
+            return
+        
+        try:
+            # Create filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.csv_filename = f"fatigue_detection_{timestamp}.csv"
+            
+            # Open CSV file
+            self.csv_file = open(self.csv_filename, 'w', newline='', encoding='utf-8')
+            self.csv_writer = csv.writer(self.csv_file)
+            
+            # Write header
+            header = [
+                'Recording_Time_Seconds',
+                'Timestamp',
+                'Amount_of_Faces',
+                'Average_Eye_Openness_%',
+                'Average_Mental_Fatigue_%',
+                'Amount_of_Glowing_Objects',
+                'Dominant_Emotion',
+                'Emotion_Confidence',
+                'Individual_Emotions_Happy',
+                'Individual_Emotions_Sad',
+                'Individual_Emotions_Angry',
+                'Individual_Emotions_Fear',
+                'Individual_Emotions_Surprise',
+                'Individual_Emotions_Disgust',
+                'Individual_Emotions_Neutral',
+                'Video_Source'
+            ]
+            
+            self.csv_writer.writerow(header)
+            self.csv_file.flush()
+            
+            self.logging_enabled = True
+            self.csv_status_label.config(text=f"Logging to: {self.csv_filename}", fg='#27ae60')
+            
+        except Exception as e:
+            print(f"Error setting up CSV logging: {e}")
+            messagebox.showerror("CSV Error", f"Failed to create CSV file: {str(e)}")
+            self.logging_enabled = False
+    
+    def log_data_to_csv(self, all_emotions, eye_openness, screens_count):
+        """Log current detection data to CSV"""
+        if not self.logging_enabled or not self.csv_writer:
+            return
+        
+        try:
+            current_time = time.time()
+            recording_time = current_time - self.start_time
+            timestamp = datetime.fromtimestamp(current_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            
+            # Calculate average emotions
+            if all_emotions:
+                avg_emotions = {}
+                for emotion in ['happy', 'sad', 'angry', 'fear', 'surprise', 'disgust', 'neutral']:
+                    avg_emotions[emotion] = np.mean([face_emotions.get(emotion, 0) for face_emotions in all_emotions])
+                
+                # Find dominant emotion
+                dominant_emotion = max(avg_emotions, key=avg_emotions.get)
+                emotion_confidence = avg_emotions[dominant_emotion]
+            else:
+                avg_emotions = {emotion: 0.0 for emotion in ['happy', 'sad', 'angry', 'fear', 'surprise', 'disgust', 'neutral']}
+                dominant_emotion = 'none'
+                emotion_confidence = 0.0
+            
+            # Prepare row data
+            row_data = [
+                round(recording_time, 3),
+                timestamp,
+                self.detected_faces_count,
+                round(eye_openness, 2) if eye_openness is not None else 'N/A',
+                round(self.fatigue_score, 2),
+                screens_count,
+                dominant_emotion,
+                round(emotion_confidence, 4),
+                round(avg_emotions['happy'], 4),
+                round(avg_emotions['sad'], 4),
+                round(avg_emotions['angry'], 4),
+                round(avg_emotions['fear'], 4),
+                round(avg_emotions['surprise'], 4),
+                round(avg_emotions['disgust'], 4),
+                round(avg_emotions['neutral'], 4),
+                'Webcam' if self.video_source == 0 else 'Video File'
+            ]
+            
+            self.csv_writer.writerow(row_data)
+            self.csv_file.flush()  # Ensure data is written immediately
+            
+        except Exception as e:
+            print(f"Error logging data to CSV: {e}")
+    
+    def close_csv_logging(self):
+        """Close CSV file and cleanup"""
+        if self.csv_file:
+            try:
+                self.csv_file.close()
+                self.logging_enabled = False
+                self.csv_status_label.config(text="Logging stopped", fg='#95a5a6')
+                if self.csv_filename:
+                    print(f"Data saved to: {self.csv_filename}")
+            except Exception as e:
+                print(f"Error closing CSV file: {e}")
         else:
             self.video_source = 0
     
@@ -394,8 +609,20 @@ class MentalFatigueDetector:
         return fatigue_percentage, len(all_emotions_data)
     
     def process_frame(self, frame):
-        """Process frame for emotion detection and eye openness analysis"""
+        """Process frame for emotion detection, eye openness analysis, and screen detection"""
         try:
+            # Detect glowing objects (screens)
+            screen_objects = self.detect_glowing_objects(frame)
+            self.detected_screens_count = len(screen_objects)
+            
+            # Draw bounding boxes for detected screens
+            for screen in screen_objects:
+                x, y, w, h = screen['bbox']
+                # Use blue color for screen detection
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                cv2.putText(frame, f"Screen ({screen['brightness']:.0f})", 
+                           (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            
             # Detect emotions for all faces
             emotion_results = self.detector.detect_emotions(frame)
             
@@ -415,7 +642,7 @@ class MentalFatigueDetector:
                     x, y, w, h = box
                     face_locations.append((y, x + w, y + h, x))  # top, right, bottom, left
                     
-                    # Draw bounding box
+                    # Draw bounding box for faces (green)
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     
                     # Add individual face emotion info
@@ -438,23 +665,36 @@ class MentalFatigueDetector:
                 else:
                     self.fatigue_score = fatigue
                 
-                # Add overall fatigue text to frame
-                fatigue_text = f"Avg Fatigue: {self.fatigue_score:.1f}% ({face_count} faces)"
-                cv2.putText(frame, fatigue_text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                # Add overall statistics to frame
+                stats_y = 30
+                cv2.putText(frame, f"Faces: {face_count} | Screens: {self.detected_screens_count}", 
+                           (10, stats_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                fatigue_text = f"Avg Fatigue: {self.fatigue_score:.1f}%"
+                cv2.putText(frame, fatigue_text, (10, stats_y + 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
                 if eye_openness is not None:
                     eye_text = f"Avg Eye Openness: {eye_openness:.1f}%"
-                    cv2.putText(frame, eye_text, (10, 60), 
+                    cv2.putText(frame, eye_text, (10, stats_y + 50), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                
+                # Log data to CSV
+                self.log_data_to_csv(all_emotions, eye_openness, self.detected_screens_count)
                 
                 # Update GUI in main thread
                 self.root.after(0, self.update_gui, all_emotions, eye_openness)
             else:
                 # No faces detected
                 self.detected_faces_count = 0
-                cv2.putText(frame, "No faces detected", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                
+                # Still show screen detection even without faces
+                stats_text = f"Screens: {self.detected_screens_count} | No faces detected"
+                cv2.putText(frame, stats_text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Log data even without faces
+                self.log_data_to_csv([], None, self.detected_screens_count)
                 
         except Exception as e:
             print(f"Error processing frame: {e}")
@@ -492,12 +732,17 @@ class MentalFatigueDetector:
                 
                 results_str += f"\nCalculated Mental Fatigue: {self.fatigue_score:.1f}%\n"
                 
+                results_str += f"Average Eye Openness: {eye_openness:.1f}%\n"
+                results_str += f"Detected Glowing Objects: {self.detected_screens_count}\n"
+                
                 if eye_openness is not None:
-                    results_str += f"Average Eye Openness: {eye_openness:.1f}%\n"
                     if eye_openness < 30:
                         results_str += "⚠️ Very low eye openness detected - high fatigue indicator\n"
                     elif eye_openness < 50:
                         results_str += "⚠️ Low eye openness detected - moderate fatigue indicator\n"
+                
+                if self.detected_screens_count > 0:
+                    results_str += f"📱 {self.detected_screens_count} bright screen(s) detected (phones/laptops)\n"
                 
                 # Show individual face details if multiple faces
                 if len(all_emotions) > 1:
@@ -575,6 +820,10 @@ class MentalFatigueDetector:
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
             
+            # Setup CSV logging
+            self.start_time = time.time()
+            self.setup_csv_logging()
+            
             # Update UI
             self.is_running = True
             self.start_button.config(state=tk.DISABLED)
@@ -591,6 +840,9 @@ class MentalFatigueDetector:
     def stop_detection(self):
         """Stop video capture and emotion detection"""
         self.is_running = False
+        
+        # Close CSV logging
+        self.close_csv_logging()
         
         # Wait for thread to finish
         if self.video_thread and self.video_thread.is_alive():
