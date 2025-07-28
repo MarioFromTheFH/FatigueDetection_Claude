@@ -1,836 +1,530 @@
-#!/usr/bin/env python3
-"""
-Mental Fatigue Detection GUI
-A cross-platform application for real-time emotion detection and mental fatigue estimation.
-"""
-
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, filedialog, messagebox
 import cv2
-from PIL import Image, ImageTk
 import numpy as np
+import pandas as pd
 import threading
 import time
-from collections import deque
-import sys
-import os
-import csv
 from datetime import datetime
+import os
+import sys
+from PIL import Image, ImageTk
+import dlib
+from scipy.spatial import distance
+import math
 
+# Try to import FER for emotion detection
 try:
     from fer import FER
+    FER_AVAILABLE = True
 except ImportError:
-    print("FER library not installed. Install with: pip install fer")
-    sys.exit(1)
-
-try:
-    import dlib
-    import face_recognition
-    EYE_DETECTION_AVAILABLE = True
-except ImportError:
-    print("Eye detection libraries not available. Install with: pip install dlib face-recognition")
-    print("Eye opening detection will be disabled.")
-    EYE_DETECTION_AVAILABLE = False
+    FER_AVAILABLE = False
+    print("FER library not available. Install with: pip install fer")
 
 class MentalFatigueDetector:
     def __init__(self, root):
         self.root = root
         self.root.title("Mental Fatigue Detection System")
-        self.root.geometry("900x700")
-        self.root.configure(bg='#2c3e50')
+        self.root.geometry("1200x800")
         
-        # Video capture variables
+        # Initialize variables
         self.cap = None
-        self.is_running = False
-        self.current_frame = None
-        self.video_source = 0  # Default webcam
-        
-        # Emotion detection
-        self.detector = FER(mtcnn=True)  # Use MTCNN for better face detection
-        
-        # Mental fatigue calculation
-        self.emotion_history = deque(maxlen=30)  # Store last 30 emotion readings
-        self.fatigue_score = 0.0
-        self.eye_openness_history = deque(maxlen=15)  # Store eye openness readings
-        self.detected_faces_count = 0
-        self.detected_screens_count = 0
-        
-        # CSV logging
-        self.start_time = None
-        self.csv_filename = None
-        self.csv_writer = None
-        self.csv_file = None
-        self.logging_enabled = False
-        
-        # Eye detection setup
-        if EYE_DETECTION_AVAILABLE:
-            self.face_landmarks_predictor = dlib.shape_predictor(self.get_landmarks_model())
-        else:
-            self.face_landmarks_predictor = None
-        
-        # Threading
+        self.is_recording = False
         self.video_thread = None
-        self.processing_thread = None
+        self.current_frame = None
+        self.fatigue_level = 0.0
+        self.data_log = []
+        self.start_time = None
+        
+        # Initialize face detection and landmark predictor
+        self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+        # Try to initialize dlib predictor
+        self.predictor = None
+        try:
+            # You'll need to download this file from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
+            self.predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
+            self.dlib_detector = dlib.get_frontal_face_detector()
+        except:
+            print("dlib predictor not found. Download 'shape_predictor_68_face_landmarks.dat' for advanced features")
+        
+        # Initialize emotion detector
+        if FER_AVAILABLE:
+            self.emotion_detector = FER(mtcnn=True)
+        else:
+            self.emotion_detector = None
+        
+        # Blink detection variables
+        self.blink_counter = 0
+        self.blink_total = 0
+        self.frame_counter = 0
+        self.blink_consecutive_frames = 0
+        
+        # Eye aspect ratio constants
+        self.EAR_THRESHOLD = 0.25
+        self.EAR_CONSECUTIVE_FRAMES = 2
         
         self.setup_gui()
         
     def setup_gui(self):
-        """Setup the main GUI interface"""
-        # Main title
-        title_label = tk.Label(
-            self.root, 
-            text="Mental Fatigue Detection System", 
-            font=("Arial", 20, "bold"),
-            bg='#2c3e50',
-            fg='white'
-        )
-        title_label.pack(pady=10)
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Control frame
-        control_frame = tk.Frame(self.root, bg='#2c3e50')
-        control_frame.pack(pady=10)
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+        
+        # Control panel
+        control_frame = ttk.LabelFrame(main_frame, text="Controls", padding="10")
+        control_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
         # Video source selection
-        source_frame = tk.Frame(control_frame, bg='#2c3e50')
-        source_frame.pack(side=tk.LEFT, padx=20)
+        ttk.Label(control_frame, text="Video Source:").grid(row=0, column=0, sticky=tk.W)
+        self.source_var = tk.StringVar(value="webcam")
+        source_frame = ttk.Frame(control_frame)
+        source_frame.grid(row=0, column=1, sticky=(tk.W, tk.E))
         
-        tk.Label(
-            source_frame, 
-            text="Video Source:", 
-            font=("Arial", 12),
-            bg='#2c3e50',
-            fg='white'
-        ).pack()
+        ttk.Radiobutton(source_frame, text="Webcam", variable=self.source_var, value="webcam").pack(side=tk.LEFT)
+        ttk.Radiobutton(source_frame, text="Video File", variable=self.source_var, value="file").pack(side=tk.LEFT)
         
-        self.source_var = tk.StringVar(value="Webcam")
-        source_combo = ttk.Combobox(
-            source_frame, 
-            textvariable=self.source_var,
-            values=["Webcam", "Video File"],
-            state="readonly",
-            width=15
-        )
-        source_combo.pack(pady=5)
-        source_combo.bind('<<ComboboxSelected>>', self.on_source_change)
+        # File selection
+        self.file_path = tk.StringVar()
+        ttk.Button(control_frame, text="Select Video File", command=self.select_video_file).grid(row=0, column=2, padx=(10, 0))
+        
+        # Camera index selection
+        ttk.Label(control_frame, text="Camera Index:").grid(row=1, column=0, sticky=tk.W)
+        self.camera_index = tk.IntVar(value=0)
+        ttk.Spinbox(control_frame, from_=0, to=5, textvariable=self.camera_index, width=10).grid(row=1, column=1, sticky=tk.W)
         
         # Control buttons
-        button_frame = tk.Frame(control_frame, bg='#2c3e50')
-        button_frame.pack(side=tk.LEFT, padx=20)
+        button_frame = ttk.Frame(control_frame)
+        button_frame.grid(row=2, column=0, columnspan=3, pady=(10, 0))
         
-        self.start_button = tk.Button(
-            button_frame,
-            text="Start Detection",
-            command=self.start_detection,
-            bg='#27ae60',
-            fg='white',
-            font=("Arial", 12, "bold"),
-            padx=20,
-            pady=5
-        )
-        self.start_button.pack(pady=2)
+        self.start_button = ttk.Button(button_frame, text="Start Detection", command=self.start_detection)
+        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
         
-        self.stop_button = tk.Button(
-            button_frame,
-            text="Stop Detection",
-            command=self.stop_detection,
-            bg='#e74c3c',
-            fg='white',
-            font=("Arial", 12, "bold"),
-            padx=20,
-            pady=5,
-            state=tk.DISABLED
-        )
-        self.stop_button.pack(pady=2)
+        self.stop_button = ttk.Button(button_frame, text="Stop Detection", command=self.stop_detection, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 10))
         
-        # CSV logging controls
-        csv_frame = tk.Frame(control_frame, bg='#2c3e50')
-        csv_frame.pack(side=tk.LEFT, padx=20)
+        ttk.Button(button_frame, text="Save CSV", command=self.save_csv).pack(side=tk.LEFT)
         
-        tk.Label(
-            csv_frame,
-            text="Data Logging:",
-            font=("Arial", 10, "bold"),
-            bg='#2c3e50',
-            fg='white'
-        ).pack()
+        # Video display and info panel
+        video_info_frame = ttk.Frame(main_frame)
+        video_info_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        video_info_frame.columnconfigure(0, weight=2)
+        video_info_frame.columnconfigure(1, weight=1)
+        video_info_frame.rowconfigure(0, weight=1)
         
-        self.logging_var = tk.BooleanVar(value=True)
-        self.logging_checkbox = tk.Checkbutton(
-            csv_frame,
-            text="Enable CSV Logging",
-            variable=self.logging_var,
-            bg='#2c3e50',
-            fg='white',
-            selectcolor='#34495e',
-            font=("Arial", 10)
-        )
-        self.logging_checkbox.pack()
+        # Video display
+        video_frame = ttk.LabelFrame(video_info_frame, text="Video Feed", padding="5")
+        video_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
+        video_frame.rowconfigure(0, weight=1)
+        video_frame.columnconfigure(0, weight=1)
         
-        self.csv_status_label = tk.Label(
-            csv_frame,
-            text="Not logging",
-            font=("Arial", 9),
-            bg='#2c3e50',
-            fg='#95a5a6'
-        )
-        self.csv_status_label.pack()
+        self.video_label = ttk.Label(video_frame, text="No video feed")
+        self.video_label.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Video display frame
-        video_frame = tk.Frame(self.root, bg='#34495e', relief=tk.RAISED, bd=2)
-        video_frame.pack(pady=20, padx=20, fill=tk.BOTH, expand=True)
+        # Info panel
+        info_frame = ttk.LabelFrame(video_info_frame, text="Analysis Results", padding="10")
+        info_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        self.video_label = tk.Label(
-            video_frame,
-            text="No video feed",
-            bg='#34495e',
-            fg='white',
-            font=("Arial", 16)
-        )
-        self.video_label.pack(expand=True)
+        # Mental Fatigue Indicator
+        ttk.Label(info_frame, text="Mental Fatigue Level:", font=("Arial", 12, "bold")).pack(anchor=tk.W)
         
-        # Mental fatigue indicator frame
-        fatigue_frame = tk.Frame(self.root, bg='#2c3e50')
-        fatigue_frame.pack(pady=10, padx=20, fill=tk.X)
+        # Progress bar for fatigue level
+        self.fatigue_var = tk.DoubleVar()
+        self.fatigue_progress = ttk.Progressbar(info_frame, variable=self.fatigue_var, maximum=100, length=200)
+        self.fatigue_progress.pack(fill=tk.X, pady=(5, 10))
         
-        # Fatigue level label
-        self.fatigue_label = tk.Label(
-            fatigue_frame,
-            text="Mental Fatigue Level: 0%",
-            font=("Arial", 16, "bold"),
-            bg='#2c3e50',
-            fg='white'
-        )
-        self.fatigue_label.pack()
+        self.fatigue_label = ttk.Label(info_frame, text="0%", font=("Arial", 11))
+        self.fatigue_label.pack(anchor=tk.W)
         
-        # Fatigue progress bar
-        self.fatigue_progress = ttk.Progressbar(
-            fatigue_frame,
-            length=400,
-            mode='determinate',
-            style='Fatigue.Horizontal.TProgressbar'
-        )
-        self.fatigue_progress.pack(pady=10)
+        # Statistics
+        stats_frame = ttk.LabelFrame(info_frame, text="Real-time Statistics", padding="5")
+        stats_frame.pack(fill=tk.X, pady=(10, 0))
         
-        # Configure progress bar colors
-        self.setup_progress_bar_style()
+        self.stats_labels = {}
+        stats_items = [
+            ("Faces Detected", "faces_count"),
+            ("Avg Eye Openness", "eye_openness"),
+            ("Blink Rate (per min)", "blink_rate"),  
+            ("Glowing Objects", "glowing_objects"),
+            ("Dominant Emotion", "emotion"),
+            ("Head Pose", "head_pose")
+        ]
         
-        # Current emotions display
-        emotions_frame = tk.Frame(self.root, bg='#2c3e50')
-        emotions_frame.pack(pady=10)
-        
-        tk.Label(
-            emotions_frame,
-            text="Detection Results:",
-            font=("Arial", 12, "bold"),
-            bg='#2c3e50',
-            fg='white'
-        ).pack()
-        
-        self.emotions_text = tk.Text(
-            emotions_frame,
-            height=6,
-            width=70,
-            bg='#34495e',
-            fg='white',
-            font=("Arial", 10)
-        )
-        self.emotions_text.pack(pady=5)
-        
-    def setup_progress_bar_style(self):
-        """Setup custom style for progress bar"""
-        style = ttk.Style()
-        style.theme_use('clam')
-        
-        # Configure progress bar to change color based on value
-        style.configure(
-            'Fatigue.Horizontal.TProgressbar',
-            background='#27ae60',  # Green for low fatigue
-            troughcolor='#34495e',
-            borderwidth=0,
-            lightcolor='#27ae60',
-            darkcolor='#27ae60'
-        )
-        
-    def update_progress_bar_color(self, value):
-        """Update progress bar color based on fatigue level"""
-        style = ttk.Style()
-        
-        if value < 30:
-            color = '#27ae60'  # Green
-        elif value < 70:
-            color = '#f39c12'  # Orange
-        else:
-            color = '#e74c3c'  # Red
-            
-        style.configure(
-            'Fatigue.Horizontal.TProgressbar',
-            background=color,
-            lightcolor=color,
-            darkcolor=color
-        )
+        for i, (label, key) in enumerate(stats_items):
+            ttk.Label(stats_frame, text=f"{label}:").grid(row=i, column=0, sticky=tk.W, pady=2)
+            self.stats_labels[key] = ttk.Label(stats_frame, text="--", foreground="blue")
+            self.stats_labels[key].grid(row=i, column=1, sticky=tk.W, padx=(10, 0), pady=2)
     
-    def on_source_change(self, event=None):
-        """Handle video source change"""
-        if self.is_running:
-            messagebox.showwarning("Warning", "Stop detection before changing source")
-            return
-            
-        if self.source_var.get() == "Video File":
-            file_path = filedialog.askopenfilename(
-                title="Select Video File",
-                filetypes=[
-                    ("Video files", "*.mp4 *.MP4 *.avi *.AVI *.mov *.MOV *.mkv *.MKV *.wmv *.WMV"),
-                    ("All files", "*.*")
-                ]
-            )
-            if file_path:
-                self.video_source = file_path
-            else:
-                self.source_var.set("Webcam")
-                self.video_source = 0
+    def select_video_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Video File",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.file_path.set(file_path)
     
-    def get_landmarks_model(self):
-        """Download and return path to facial landmarks model"""
-        import urllib.request
-        import os
-        
-        model_path = "shape_predictor_68_face_landmarks.dat"
-        
-        if not os.path.exists(model_path):
-            print("Downloading facial landmarks model (this may take a while)...")
-            url = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
-            try:
-                urllib.request.urlretrieve(url, "shape_predictor_68_face_landmarks.dat.bz2")
-                
-                # Extract bz2 file
-                import bz2
-                with bz2.BZ2File("shape_predictor_68_face_landmarks.dat.bz2", 'rb') as f:
-                    with open(model_path, 'wb') as out_file:
-                        out_file.write(f.read())
-                
-                # Clean up
-                os.remove("shape_predictor_68_face_landmarks.dat.bz2")
-                print("Model downloaded successfully!")
-                
-            except Exception as e:
-                print(f"Failed to download landmarks model: {e}")
-                print("Eye detection will be disabled.")
-                return None
-        
-        return model_path
-    
-    def calculate_eye_aspect_ratio(self, eye_points):
-        """Calculate Eye Aspect Ratio (EAR) to determine eye openness"""
-        # Compute the euclidean distances between the two sets of
-        # vertical eye landmarks (x, y)-coordinates
-        A = np.linalg.norm(eye_points[1] - eye_points[5])
-        B = np.linalg.norm(eye_points[2] - eye_points[4])
-        
-        # Compute the euclidean distance between the horizontal
-        # eye landmark (x, y)-coordinates
-        C = np.linalg.norm(eye_points[0] - eye_points[3])
-        
-        # Compute the eye aspect ratio
+    def calculate_ear(self, eye_points):
+        """Calculate Eye Aspect Ratio"""
+        # Vertical eye landmarks
+        A = distance.euclidean(eye_points[1], eye_points[5])
+        B = distance.euclidean(eye_points[2], eye_points[4])
+        # Horizontal eye landmark
+        C = distance.euclidean(eye_points[0], eye_points[3])
+        # Eye aspect ratio
         ear = (A + B) / (2.0 * C)
         return ear
     
-    def get_eye_openness(self, frame, face_locations):
-        """Calculate average eye openness for all detected faces"""
-        if not EYE_DETECTION_AVAILABLE or not self.face_landmarks_predictor:
-            return None
+    def detect_blinks(self, landmarks):
+        """Detect blinks using eye aspect ratio"""
+        if landmarks is None:
+            return 0, 0
         
-        try:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            eye_openness_scores = []
-            
-            for face_location in face_locations:
-                # Convert face_recognition format to dlib format
-                top, right, bottom, left = face_location
-                dlib_rect = dlib.rectangle(left, top, right, bottom)
-                
-                # Get facial landmarks
-                landmarks = self.face_landmarks_predictor(gray, dlib_rect)
-                
-                # Extract left and right eye coordinates
-                left_eye = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(36, 42)])
-                right_eye = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(42, 48)])
-                
-                # Calculate eye aspect ratio for both eyes
-                left_ear = self.calculate_eye_aspect_ratio(left_eye)
-                right_ear = self.calculate_eye_aspect_ratio(right_eye)
-                
-                # Average the eye aspect ratio together for both eyes
-                avg_ear = (left_ear + right_ear) / 2.0
-                
-                # Convert EAR to eye openness percentage (normalized)
-                # EAR typically ranges from ~0.15 (closed) to ~0.35 (wide open)
-                eye_openness = min(max((avg_ear - 0.15) / (0.35 - 0.15), 0), 1) * 100
-                eye_openness_scores.append(eye_openness)
-            
-            return np.mean(eye_openness_scores) if eye_openness_scores else None
-            
-        except Exception as e:
-            print(f"Error calculating eye openness: {e}")
-            return None
+        # Eye landmark indices (68-point model)
+        left_eye = landmarks[36:42]
+        right_eye = landmarks[42:48]
+        
+        # Calculate EAR for both eyes
+        left_ear = self.calculate_ear(left_eye)
+        right_ear = self.calculate_ear(right_eye)
+        ear = (left_ear + right_ear) / 2.0
+        
+        # Check for blink
+        if ear < self.EAR_THRESHOLD:
+            self.blink_consecutive_frames += 1
+        else:
+            if self.blink_consecutive_frames >= self.EAR_CONSECUTIVE_FRAMES:
+                self.blink_total += 1
+            self.blink_consecutive_frames = 0
+        
+        return ear, self.blink_total
     
     def detect_glowing_objects(self, frame):
-        """Detect bright/glowing objects like phone or laptop screens"""
+        """Detect bright/glowing objects like screens"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur
+        blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+        
+        # Threshold for bright areas
+        _, bright_areas = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+        
+        # Find contours
+        contours, _ = cv2.findContours(bright_areas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours by area (to avoid noise)
+        glowing_objects = [c for c in contours if cv2.contourArea(c) > 500]
+        
+        return len(glowing_objects), glowing_objects
+    
+    def calculate_head_pose(self, landmarks):
+        """Calculate head pose estimation"""
+        if landmarks is None or len(landmarks) < 68:
+            return "Unknown"
+        
+        # 3D model points
+        model_points = np.array([
+            (0.0, 0.0, 0.0),             # Nose tip
+            (0.0, -330.0, -65.0),        # Chin
+            (-225.0, 170.0, -135.0),     # Left eye left corner
+            (225.0, 170.0, -135.0),      # Right eye right corner
+            (-150.0, -150.0, -125.0),    # Left mouth corner
+            (150.0, -150.0, -125.0)      # Right mouth corner
+        ])
+        
+        # 2D image points from landmarks
+        image_points = np.array([
+            landmarks[30],     # Nose tip
+            landmarks[8],      # Chin
+            landmarks[36],     # Left eye left corner
+            landmarks[45],     # Right eye right corner
+            landmarks[48],     # Left mouth corner
+            landmarks[54]      # Right mouth corner
+        ], dtype="double")
+        
+        # Camera matrix (approximate)
+        size = (640, 480)  # Assume standard resolution
+        focal_length = size[1]
+        center = (size[1]/2, size[0]/2)
+        camera_matrix = np.array([
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1]
+        ], dtype="double")
+        
+        dist_coeffs = np.zeros((4,1))
+        
         try:
-            # Convert to grayscale for brightness analysis
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            success, rotation_vector, translation_vector = cv2.solvePnP(
+                model_points, image_points, camera_matrix, dist_coeffs)
             
-            # Apply Gaussian blur to reduce noise
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Threshold for bright objects (adjust based on lighting conditions)
-            # Use adaptive threshold to handle varying lighting
-            adaptive_thresh = cv2.adaptiveThreshold(
-                blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, -10
-            )
-            
-            # Also use a fixed high threshold for very bright objects
-            _, bright_thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-            
-            # Combine both thresholding methods
-            combined_thresh = cv2.bitwise_or(adaptive_thresh, bright_thresh)
-            
-            # Morphological operations to clean up the image
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            combined_thresh = cv2.morphologyEx(combined_thresh, cv2.MORPH_CLOSE, kernel)
-            combined_thresh = cv2.morphologyEx(combined_thresh, cv2.MORPH_OPEN, kernel)
-            
-            # Find contours of bright objects
-            contours, _ = cv2.findContours(combined_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            screen_objects = []
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
+            if success:
+                # Convert rotation vector to rotation matrix
+                rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
                 
-                # Filter by area (screens should be reasonably large)
-                if 500 < area < 50000:  # Adjust these values based on your needs
-                    # Get bounding rectangle
-                    x, y, w, h = cv2.boundingRect(contour)
-                    
-                    # Filter by aspect ratio (screens are usually rectangular)
-                    aspect_ratio = w / h
-                    if 0.3 < aspect_ratio < 4.0:  # Allow various screen orientations
-                        
-                        # Check if the region is actually bright enough
-                        roi = gray[y:y+h, x:x+w]
-                        mean_brightness = np.mean(roi)
-                        
-                        if mean_brightness > 120:  # Brightness threshold
-                            screen_objects.append({
-                                'bbox': (x, y, w, h),
-                                'area': area,
-                                'brightness': mean_brightness,
-                                'aspect_ratio': aspect_ratio
-                            })
-            
-            # Sort by area (larger objects first) and limit to most significant ones
-            screen_objects.sort(key=lambda x: x['area'], reverse=True)
-            screen_objects = screen_objects[:10]  # Max 10 objects to avoid clutter
-            
-            return screen_objects
-            
-        except Exception as e:
-            print(f"Error detecting glowing objects: {e}")
-            return []
-    
-    def setup_csv_logging(self):
-        """Setup CSV file for data logging"""
-        if not self.logging_var.get():
-            return
-        
-        try:
-            # Create filename with timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.csv_filename = f"fatigue_detection_{timestamp}.csv"
-            
-            # Open CSV file
-            self.csv_file = open(self.csv_filename, 'w', newline='', encoding='utf-8')
-            self.csv_writer = csv.writer(self.csv_file)
-            
-            # Write header
-            header = [
-                'Recording_Time_Seconds',
-                'Timestamp',
-                'Amount_of_Faces',
-                'Average_Eye_Openness_%',
-                'Average_Mental_Fatigue_%',
-                'Amount_of_Glowing_Objects',
-                'Dominant_Emotion',
-                'Emotion_Confidence',
-                'Individual_Emotions_Happy',
-                'Individual_Emotions_Sad',
-                'Individual_Emotions_Angry',
-                'Individual_Emotions_Fear',
-                'Individual_Emotions_Surprise',
-                'Individual_Emotions_Disgust',
-                'Individual_Emotions_Neutral',
-                'Video_Source'
-            ]
-            
-            self.csv_writer.writerow(header)
-            self.csv_file.flush()
-            
-            self.logging_enabled = True
-            self.csv_status_label.config(text=f"Logging to: {self.csv_filename}", fg='#27ae60')
-            
-        except Exception as e:
-            print(f"Error setting up CSV logging: {e}")
-            messagebox.showerror("CSV Error", f"Failed to create CSV file: {str(e)}")
-            self.logging_enabled = False
-    
-    def log_data_to_csv(self, all_emotions, eye_openness, screens_count):
-        """Log current detection data to CSV"""
-        if not self.logging_enabled or not self.csv_writer:
-            return
-        
-        try:
-            current_time = time.time()
-            recording_time = current_time - self.start_time
-            timestamp = datetime.fromtimestamp(current_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            
-            # Calculate average emotions
-            if all_emotions:
-                avg_emotions = {}
-                for emotion in ['happy', 'sad', 'angry', 'fear', 'surprise', 'disgust', 'neutral']:
-                    avg_emotions[emotion] = np.mean([face_emotions.get(emotion, 0) for face_emotions in all_emotions])
+                # Calculate Euler angles
+                angles = cv2.RQDecomp3x3(rotation_matrix)[0]
                 
-                # Find dominant emotion
-                dominant_emotion = max(avg_emotions, key=avg_emotions.get)
-                emotion_confidence = avg_emotions[dominant_emotion]
-            else:
-                avg_emotions = {emotion: 0.0 for emotion in ['happy', 'sad', 'angry', 'fear', 'surprise', 'disgust', 'neutral']}
-                dominant_emotion = 'none'
-                emotion_confidence = 0.0
-            
-            # Prepare row data
-            row_data = [
-                round(recording_time, 3),
-                timestamp,
-                self.detected_faces_count,
-                round(eye_openness, 2) if eye_openness is not None else 'N/A',
-                round(self.fatigue_score, 2),
-                screens_count,
-                dominant_emotion,
-                round(emotion_confidence, 4),
-                round(avg_emotions['happy'], 4),
-                round(avg_emotions['sad'], 4),
-                round(avg_emotions['angry'], 4),
-                round(avg_emotions['fear'], 4),
-                round(avg_emotions['surprise'], 4),
-                round(avg_emotions['disgust'], 4),
-                round(avg_emotions['neutral'], 4),
-                'Webcam' if self.video_source == 0 else 'Video File'
-            ]
-            
-            self.csv_writer.writerow(row_data)
-            self.csv_file.flush()  # Ensure data is written immediately
-            
-        except Exception as e:
-            print(f"Error logging data to CSV: {e}")
+                # Determine head pose
+                if angles[1] > 10:
+                    return "Looking Right"
+                elif angles[1] < -10:
+                    return "Looking Left"
+                elif angles[0] > 10:
+                    return "Looking Up"
+                elif angles[0] < -10:
+                    return "Looking Down"
+                else:
+                    return "Forward"
+        except:
+            pass
+        
+        return "Unknown"
     
-    def close_csv_logging(self):
-        """Close CSV file and cleanup"""
-        if self.csv_file:
-            try:
-                self.csv_file.close()
-                self.logging_enabled = False
-                self.csv_status_label.config(text="Logging stopped", fg='#95a5a6')
-                if self.csv_filename:
-                    print(f"Data saved to: {self.csv_filename}")
-            except Exception as e:
-                print(f"Error closing CSV file: {e}")
-        else:
-            self.video_source = 0
-    
-    def calculate_mental_fatigue(self, all_emotions_data, eye_openness=None):
-        """
-        Calculate mental fatigue based on emotion scores from all detected faces
-        Combines boredom (neutral + sad) and tiredness indicators
-        Now includes eye openness as a fatigue indicator
-        """
-        if not all_emotions_data:
-            return 0.0, 0
+    def calculate_fatigue_level(self, emotion_data, eye_openness, blink_rate, head_pose):
+        """Calculate mental fatigue level based on multiple factors"""
+        fatigue_score = 0.0
         
-        face_fatigue_scores = []
+        # Emotion-based fatigue (30% weight)
+        if emotion_data:
+            # Higher fatigue for tired-looking emotions
+            emotion_weights = {
+                'sad': 0.7,
+                'neutral': 0.4,
+                'angry': 0.6,
+                'fear': 0.5,
+                'surprise': 0.2,
+                'disgust': 0.3,
+                'happy': 0.1
+            }
+            
+            for emotion, confidence in emotion_data.items():
+                if emotion in emotion_weights:
+                    fatigue_score += confidence * emotion_weights[emotion] * 0.3
         
-        # Calculate fatigue for each detected face
-        for emotions in all_emotions_data:
-            # Extract emotion scores
-            neutral = emotions.get('neutral', 0)
-            sad = emotions.get('sad', 0)
-            angry = emotions.get('angry', 0)
-            fear = emotions.get('fear', 0)
-            happy = emotions.get('happy', 0)
-            
-            # Calculate fatigue components
-            # Boredom: high neutral, low happy
-            boredom_score = neutral * (1 - happy)
-            
-            # Tiredness: combination of sad, angry, and fear (stress indicators)
-            tiredness_score = (sad + angry + fear) / 3
-            
-            # Combined emotional fatigue (weighted average)
-            emotional_fatigue = (boredom_score * 0.6 + tiredness_score * 0.4)
-            
-            face_fatigue_scores.append(emotional_fatigue)
+        # Eye openness (25% weight)
+        if eye_openness < 0.2:  # Very closed eyes
+            fatigue_score += 0.25
+        elif eye_openness < 0.25:  # Partially closed
+            fatigue_score += 0.15
         
-        # Average fatigue across all faces
-        avg_emotional_fatigue = np.mean(face_fatigue_scores)
+        # Abnormal blink rate (25% weight)
+        normal_blink_rate = 17  # Average blinks per minute
+        if blink_rate > normal_blink_rate * 1.5:  # Too many blinks
+            fatigue_score += 0.2
+        elif blink_rate < normal_blink_rate * 0.5:  # Too few blinks
+            fatigue_score += 0.15
         
-        # Incorporate eye openness if available
-        if eye_openness is not None:
-            # Store eye openness history
-            self.eye_openness_history.append(eye_openness)
-            
-            # Calculate smoothed eye openness
-            if len(self.eye_openness_history) > 3:
-                smoothed_eye_openness = np.mean(list(self.eye_openness_history)[-5:])
-            else:
-                smoothed_eye_openness = eye_openness
-            
-            # Convert eye openness to fatigue indicator
-            # Lower eye openness = higher fatigue
-            eye_fatigue = (100 - smoothed_eye_openness) / 100
-            
-            # Combine emotional fatigue with eye fatigue
-            # Weight: 70% emotions, 30% eye openness
-            combined_fatigue = (avg_emotional_fatigue * 0.7 + eye_fatigue * 0.3)
-        else:
-            combined_fatigue = avg_emotional_fatigue
+        # Head pose (20% weight)
+        if head_pose == "Looking Down":
+            fatigue_score += 0.2
+        elif head_pose in ["Looking Right", "Looking Left"]:
+            fatigue_score += 0.1
         
-        # Normalize to 0-100 scale
-        fatigue_percentage = min(combined_fatigue * 100, 100)
-        
-        return fatigue_percentage, len(all_emotions_data)
+        return min(fatigue_score * 100, 100)  # Convert to percentage, cap at 100%
     
     def process_frame(self, frame):
-        """Process frame for emotion detection, eye openness analysis, and screen detection"""
-        try:
-            # Detect glowing objects (screens)
-            screen_objects = self.detect_glowing_objects(frame)
-            self.detected_screens_count = len(screen_objects)
-            
-            # Draw bounding boxes for detected screens
-            for screen in screen_objects:
-                x, y, w, h = screen['bbox']
-                # Use blue color for screen detection
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                cv2.putText(frame, f"Screen ({screen['brightness']:.0f})", 
-                           (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-            
-            # Detect emotions for all faces
-            emotion_results = self.detector.detect_emotions(frame)
-            
-            if emotion_results:
-                # Extract all emotions and face locations
-                all_emotions = []
-                face_locations = []
-                
-                # Draw bounding boxes and collect data
-                for face_data in emotion_results:
-                    emotions = face_data['emotions']
-                    box = face_data['box']
-                    
-                    all_emotions.append(emotions)
-                    
-                    # Convert box format for face_recognition library
-                    x, y, w, h = box
-                    face_locations.append((y, x + w, y + h, x))  # top, right, bottom, left
-                    
-                    # Draw bounding box for faces (green)
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    
-                    # Add individual face emotion info
-                    dominant_emotion = max(emotions, key=emotions.get)
-                    confidence = emotions[dominant_emotion]
-                    cv2.putText(frame, f"{dominant_emotion}: {confidence:.2f}", 
-                               (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # Calculate eye openness for all faces
-                eye_openness = self.get_eye_openness(frame, face_locations)
-                
-                # Calculate mental fatigue for all detected faces
-                fatigue, face_count = self.calculate_mental_fatigue(all_emotions, eye_openness)
-                self.emotion_history.append(fatigue)
-                self.detected_faces_count = face_count
-                
-                # Smooth fatigue score using moving average
-                if len(self.emotion_history) > 5:
-                    self.fatigue_score = np.mean(list(self.emotion_history)[-10:])
-                else:
-                    self.fatigue_score = fatigue
-                
-                # Add overall statistics to frame
-                stats_y = 30
-                cv2.putText(frame, f"Faces: {face_count} | Screens: {self.detected_screens_count}", 
-                           (10, stats_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                fatigue_text = f"Avg Fatigue: {self.fatigue_score:.1f}%"
-                cv2.putText(frame, fatigue_text, (10, stats_y + 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                
-                if eye_openness is not None:
-                    eye_text = f"Avg Eye Openness: {eye_openness:.1f}%"
-                    cv2.putText(frame, eye_text, (10, stats_y + 50), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                
-                # Log data to CSV
-                self.log_data_to_csv(all_emotions, eye_openness, self.detected_screens_count)
-                
-                # Update GUI in main thread
-                self.root.after(0, self.update_gui, all_emotions, eye_openness)
-            else:
-                # No faces detected
-                self.detected_faces_count = 0
-                
-                # Still show screen detection even without faces
-                stats_text = f"Screens: {self.detected_screens_count} | No faces detected"
-                cv2.putText(frame, stats_text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                # Log data even without faces
-                self.log_data_to_csv([], None, self.detected_screens_count)
-                
-        except Exception as e:
-            print(f"Error processing frame: {e}")
+        """Process a single frame for fatigue detection"""
+        if frame is None:
+            return frame
         
-        return frame
-    
-    def update_gui(self, all_emotions, eye_openness=None):
-        """Update GUI elements with current emotion data from all faces"""
-        # Update fatigue level
-        fatigue_percent = int(self.fatigue_score)
-        faces_text = "face" if self.detected_faces_count == 1 else "faces"
-        self.fatigue_label.config(
-            text=f"Mental Fatigue Level: {fatigue_percent}% ({self.detected_faces_count} {faces_text})"
-        )
-        self.fatigue_progress['value'] = fatigue_percent
-        self.update_progress_bar_color(fatigue_percent)
+        # Convert to RGB for display
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Update emotions display
-        self.emotions_text.delete(1.0, tk.END)
+        # Face detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_detector.detectMultiScale(gray, 1.1, 4)
         
-        if self.detected_faces_count == 0:
-            self.emotions_text.insert(tk.END, "No faces detected in current frame")
+        face_count = len(faces)
+        avg_eye_openness = 0
+        emotion_data = {}
+        head_pose = "Unknown"
+        
+        # Process each face
+        for (x, y, w, h) in faces:
+            # Draw rectangle around face
+            cv2.rectangle(rgb_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+            
+            # Emotion detection
+            if self.emotion_detector:
+                try:
+                    face_region = frame[y:y+h, x:x+w]
+                    emotions = self.emotion_detector.detect_emotions(face_region)
+                    if emotions:
+                        emotion_data = emotions[0]['emotions']
+                        dominant_emotion = max(emotion_data, key=emotion_data.get)
+                        confidence = emotion_data[dominant_emotion]
+                        
+                        # Display emotion
+                        cv2.putText(rgb_frame, f"{dominant_emotion}: {confidence:.2f}", 
+                                  (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                except:
+                    pass
+            
+            # Landmark detection for advanced features
+            if self.predictor:
+                try:
+                    dlib_rect = dlib.rectangle(x, y, x + w, y + h)
+                    landmarks = self.predictor(gray, dlib_rect)
+                    
+                    # Convert landmarks to numpy array
+                    landmark_points = []
+                    for n in range(68):
+                        point = landmarks.part(n)
+                        landmark_points.append([point.x, point.y])
+                    landmark_points = np.array(landmark_points)
+                    
+                    # Eye openness and blink detection
+                    eye_openness, total_blinks = self.detect_blinks(landmark_points)
+                    avg_eye_openness = eye_openness
+                    
+                    # Head pose estimation
+                    head_pose = self.calculate_head_pose(landmark_points)
+                    
+                    # Draw eye landmarks
+                    for point in landmark_points[36:48]:  # Eye landmarks
+                        cv2.circle(rgb_frame, tuple(point), 1, (0, 255, 255), -1)
+                        
+                except:
+                    pass
+        
+        # Detect glowing objects
+        glowing_count, glowing_contours = self.detect_glowing_objects(frame)
+        
+        # Draw glowing objects
+        for contour in glowing_contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            cv2.rectangle(rgb_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            cv2.putText(rgb_frame, "Glowing", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        
+        # Calculate blink rate (per minute)
+        if self.start_time:
+            elapsed_minutes = (time.time() - self.start_time) / 60.0
+            blink_rate = self.blink_total / max(elapsed_minutes, 1/60)  # Avoid division by zero
         else:
-            results_str = f"Detected {self.detected_faces_count} face(s):\n\n"
-            
-            # Show average emotions across all faces
-            if all_emotions:
-                avg_emotions = {}
-                for emotion in ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']:
-                    avg_emotions[emotion] = np.mean([face_emotions.get(emotion, 0) for face_emotions in all_emotions])
-                
-                results_str += "Average Emotions Across All Faces:\n"
-                for emotion, score in avg_emotions.items():
-                    results_str += f"  {emotion.capitalize()}: {score:.3f}\n"
-                
-                results_str += f"\nCalculated Mental Fatigue: {self.fatigue_score:.1f}%\n"
-                
-                results_str += f"Average Eye Openness: {eye_openness:.1f}%\n"
-                results_str += f"Detected Glowing Objects: {self.detected_screens_count}\n"
-                
-                if eye_openness is not None:
-                    if eye_openness < 30:
-                        results_str += "⚠️ Very low eye openness detected - high fatigue indicator\n"
-                    elif eye_openness < 50:
-                        results_str += "⚠️ Low eye openness detected - moderate fatigue indicator\n"
-                
-                if self.detected_screens_count > 0:
-                    results_str += f"📱 {self.detected_screens_count} bright screen(s) detected (phones/laptops)\n"
-                
-                # Show individual face details if multiple faces
-                if len(all_emotions) > 1:
-                    results_str += f"\nIndividual Face Details:\n"
-                    for i, emotions in enumerate(all_emotions, 1):
-                        dominant = max(emotions, key=emotions.get)
-                        results_str += f"  Face {i}: {dominant} ({emotions[dominant]:.3f})\n"
-            
-            self.emotions_text.insert(tk.END, results_str)
-    
-    def video_capture_loop(self):
-        """Main video capture and processing loop"""
-        while self.is_running:
-            try:
-                ret, frame = self.cap.read()
-                if not ret:
-                    if isinstance(self.video_source, str):  # Video file ended
-                        print("Video file ended or cannot be read")
-                        # Reset video to beginning for continuous playback
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        continue
-                    else:
-                        print("Failed to read from webcam")
-                        continue
-                
-                # Flip frame for webcam (mirror effect)
-                if self.video_source == 0:
-                    frame = cv2.flip(frame, 1)
-                
-                # Process frame for emotion detection
-                processed_frame = self.process_frame(frame.copy())
-                
-                # Convert frame for tkinter display
-                frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-                frame_pil = Image.fromarray(frame_rgb)
-                
-                # Resize frame to fit display
-                display_size = (640, 480)
-                frame_pil = frame_pil.resize(display_size, Image.Resampling.LANCZOS)
-                
-                frame_tk = ImageTk.PhotoImage(frame_pil)
-                
-                # Update video display in main thread
-                self.root.after(0, self.update_video_display, frame_tk)
-                
-                # Control frame rate
-                time.sleep(0.03)  # ~30 FPS
-                
-            except Exception as e:
-                print(f"Error in video loop: {e}")
-                break
+            blink_rate = 0
         
-        # Cleanup
-        if self.cap:
-            self.cap.release()
-        self.root.after(0, self.video_stopped)
+        # Calculate fatigue level
+        self.fatigue_level = self.calculate_fatigue_level(emotion_data, avg_eye_openness, blink_rate, head_pose)
+        
+        # Update GUI
+        self.update_stats(face_count, avg_eye_openness, blink_rate, glowing_count, emotion_data, head_pose)
+        
+        # Log data
+        if self.is_recording:
+            current_time = time.time() - self.start_time if self.start_time else 0
+            log_entry = {
+                'Recording Time': current_time,
+                'Amount of Recorded Faces': face_count,
+                'Average Eye Openness': avg_eye_openness,
+                'Average Mental Fatigue Level': self.fatigue_level,
+                'Amount of Glowing Objects': glowing_count,
+                'Average Total Blinking Rate': blink_rate,
+                'Dominant Emotion': max(emotion_data, key=emotion_data.get) if emotion_data else 'Unknown',
+                'Head Pose': head_pose,
+                'Frame Number': self.frame_counter
+            }
+            self.data_log.append(log_entry)
+        
+        self.frame_counter += 1
+        return rgb_frame
     
-    def update_video_display(self, frame_tk):
-        """Update video display widget"""
-        self.video_label.configure(image=frame_tk, text="")
-        self.video_label.image = frame_tk  # Keep a reference
+    def update_stats(self, face_count, eye_openness, blink_rate, glowing_count, emotion_data, head_pose):
+        """Update GUI statistics"""
+        self.stats_labels['faces_count'].config(text=str(face_count))
+        self.stats_labels['eye_openness'].config(text=f"{eye_openness:.3f}" if eye_openness > 0 else "--")
+        self.stats_labels['blink_rate'].config(text=f"{blink_rate:.1f}")
+        self.stats_labels['glowing_objects'].config(text=str(glowing_count))
+        
+        if emotion_data:
+            dominant_emotion = max(emotion_data, key=emotion_data.get)
+            confidence = emotion_data[dominant_emotion]
+            self.stats_labels['emotion'].config(text=f"{dominant_emotion} ({confidence:.2f})")
+        else:
+            self.stats_labels['emotion'].config(text="--")
+        
+        self.stats_labels['head_pose'].config(text=head_pose)
+        
+        # Update fatigue level
+        self.fatigue_var.set(self.fatigue_level)
+        self.fatigue_label.config(text=f"{self.fatigue_level:.1f}%")
+        
+        # Color code fatigue level
+        if self.fatigue_level < 30:
+            color = "green"
+        elif self.fatigue_level < 60:
+            color = "orange"  
+        else:
+            color = "red"
+        self.fatigue_label.config(foreground=color)
+    
+    def video_loop(self):
+        """Main video processing loop"""
+        while self.is_recording and self.cap:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
+            # Process frame
+            processed_frame = self.process_frame(frame)
+            
+            if processed_frame is not None:
+                # Resize for display
+                height, width = processed_frame.shape[:2]
+                display_width = 600
+                display_height = int(height * display_width / width)
+                processed_frame = cv2.resize(processed_frame, (display_width, display_height))
+                
+                # Convert to PhotoImage for tkinter
+                self.current_frame = processed_frame
+                image = Image.fromarray(processed_frame)
+                photo = ImageTk.PhotoImage(image)
+                
+                # Update display in main thread
+                self.root.after(0, self.update_video_display, photo)
+            
+            # Control frame rate
+            time.sleep(0.03)  # ~30 FPS
+    
+    def update_video_display(self, photo):
+        """Update video display (called from main thread)"""
+        self.video_label.configure(image=photo)
+        self.video_label.image = photo  # Keep a reference
     
     def start_detection(self):
-        """Start video capture and emotion detection"""
+        """Start video capture and processing"""
         try:
             # Initialize video capture
-            self.cap = cv2.VideoCapture(self.video_source)
+            if self.source_var.get() == "webcam":
+                self.cap = cv2.VideoCapture(self.camera_index.get())
+            else:
+                if not self.file_path.get():
+                    messagebox.showerror("Error", "Please select a video file")
+                    return
+                self.cap = cv2.VideoCapture(self.file_path.get())
             
             if not self.cap.isOpened():
                 messagebox.showerror("Error", "Could not open video source")
                 return
             
-            # Set video properties for better performance
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self.cap.set(cv2.CAP_PROP_FPS, 30)
-            
-            # Setup CSV logging
+            # Reset counters
+            self.blink_total = 0
+            self.frame_counter = 0
+            self.data_log = []
             self.start_time = time.time()
-            self.setup_csv_logging()
             
-            # Update UI
-            self.is_running = True
+            # Start recording
+            self.is_recording = True
             self.start_button.config(state=tk.DISABLED)
             self.stop_button.config(state=tk.NORMAL)
             
-            # Start video capture thread
-            self.video_thread = threading.Thread(target=self.video_capture_loop)
+            # Start video processing thread
+            self.video_thread = threading.Thread(target=self.video_loop)
             self.video_thread.daemon = True
             self.video_thread.start()
             
@@ -838,75 +532,75 @@ class MentalFatigueDetector:
             messagebox.showerror("Error", f"Failed to start detection: {str(e)}")
     
     def stop_detection(self):
-        """Stop video capture and emotion detection"""
-        self.is_running = False
+        """Stop video capture and processing"""
+        self.is_recording = False
         
-        # Close CSV logging
-        self.close_csv_logging()
+        if self.cap:
+            self.cap.release()
+            self.cap = None
         
-        # Wait for thread to finish
-        if self.video_thread and self.video_thread.is_alive():
-            self.video_thread.join(timeout=2)
-    
-    def video_stopped(self):
-        """Called when video capture stops"""
+        if self.video_thread:
+            self.video_thread.join(timeout=1.0)
+        
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
-        self.video_label.configure(image="", text="No video feed")
-        self.video_label.image = None
+        
+        # Clear video display
+        self.video_label.config(image="", text="Detection stopped")
+        
+        messagebox.showinfo("Detection Stopped", f"Recorded {len(self.data_log)} frames of data")
     
-    def on_closing(self):
-        """Handle application closing"""
-        self.stop_detection()
-        self.root.destroy()
+    def save_csv(self):
+        """Save logged data to CSV file"""
+        if not self.data_log:
+            messagebox.showwarning("No Data", "No data to save")
+            return
+        
+        try:
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"mental_fatigue_data_{timestamp}.csv"
+            
+            # Convert to DataFrame and save
+            df = pd.DataFrame(self.data_log)
+            df.to_csv(filename, index=False)
+            
+            messagebox.showinfo("Data Saved", f"Data saved to {filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save data: {str(e)}")
 
 def main():
-    """Main application entry point"""
-    # Check for required libraries
-    required_libs = [
-        ('cv2', 'opencv-python'),
-        ('PIL', 'Pillow'), 
-        ('fer', 'fer'),
-        ('numpy', 'numpy')
-    ]
+    # Check dependencies
+    missing_deps = []
     
-    optional_libs = [
-        ('dlib', 'dlib'),
-        ('face_recognition', 'face-recognition')
-    ]
+    if not FER_AVAILABLE:
+        missing_deps.append("fer (pip install fer)")
     
-    missing_libs = []
-    missing_optional = []
+    try:
+        import dlib
+    except ImportError:
+        missing_deps.append("dlib (pip install dlib)")
     
-    for lib, install_name in required_libs:
-        try:
-            __import__(lib)
-        except ImportError:
-            missing_libs.append((lib, install_name))
-    
-    for lib, install_name in optional_libs:
-        try:
-            __import__(lib)
-        except ImportError:
-            missing_optional.append((lib, install_name))
-    
-    if missing_libs:
-        print("Missing required libraries:")
-        for lib, install_name in missing_libs:
-            print(f"  Install {lib}: pip install {install_name}")
-        sys.exit(1)
-    
-    if missing_optional:
-        print("Missing optional libraries (eye detection will be disabled):")
-        for lib, install_name in missing_optional:
-            print(f"  Install {lib}: pip install {install_name}")
-        print("The application will still work without eye detection.\n")
+    if missing_deps:
+        print("Warning: Missing optional dependencies:")
+        for dep in missing_deps:
+            print(f"  - {dep}")
+        print("Some features may not work properly.")
+        print()
     
     # Create and run application
     root = tk.Tk()
     app = MentalFatigueDetector(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("Application interrupted")
+    finally:
+        if app.cap:
+            app.cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
