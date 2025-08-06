@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 import dlib
 from scipy.spatial import distance
 import math
+import random
 
 # Try to import FER for emotion detection
 try:
@@ -70,6 +71,15 @@ class MentalFatigueDetector:
         # Main frame
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Initialize ttk.Style for custom progress bar colors
+        self.style = ttk.Style()
+        self._configure_styles()
+
+        # Dictionaries to hold references to Tkinter widgets and variables
+        self.sensor_labels = {}
+        self.progress_vars = {}
+        self.progress_bars = {}
         
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
@@ -160,6 +170,123 @@ class MentalFatigueDetector:
             ttk.Label(stats_frame, text=f"{label}:").grid(row=i, column=0, sticky=tk.W, pady=2)
             self.stats_labels[key] = ttk.Label(stats_frame, text="--", foreground="blue")
             self.stats_labels[key].grid(row=i, column=1, sticky=tk.W, padx=(10, 0), pady=2)
+
+        # LabelFrame specifically for sensor data display
+        sensor_frame = ttk.LabelFrame(info_frame, text="Sensor Data", padding="5")
+        sensor_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # Define sensor items with their display labels, data keys, and maximum values for progress bars
+        sensor_items = [
+            ("Temperature", "room_temp", 30), # Max value for temperature (e.g., up to 30°C)
+            ("CO₂", "co2_saturation", 2000), # Max value for CO2 (e.g., up to 2000 ppm)
+            ("O₂⁻", "o2neg_saturation", 2000), # Max value for O2- ions (e.g., up to 2000 ions/cm³)
+            ("Humidity", "humidity_percentage", 100), # Max value for humidity (0-100%)
+        ]
+
+        # Loop through each sensor item to create its label, value display, and progress bar
+        for i, (label_text, key, max_value) in enumerate(sensor_items):
+            # Sensor Name Label (e.g., "Temperature:")
+            ttk.Label(sensor_frame, text=f"{label_text}:").grid(row=i, column=0, sticky=tk.W, pady=2, padx=5)
+
+            # Current Value Label (e.g., "22.5")
+            self.sensor_labels[key] = ttk.Label(sensor_frame, text="--", foreground="blue")
+            self.sensor_labels[key].grid(row=i, column=1, sticky=tk.W, padx=(10, 0), pady=2)
+
+            # Progress Bar for the sensor
+            self.progress_vars[key] = tk.DoubleVar() # Variable to control progress bar value
+            progress_bar = ttk.Progressbar(sensor_frame, variable=self.progress_vars[key], maximum=max_value, length=200)
+            # Use grid for the progress bar to be consistent with other widgets in sensor_frame
+            progress_bar.grid(row=i, column=2, sticky=tk.EW, padx=(10, 5), pady=2)
+            self.progress_bars[key] = progress_bar # Store reference to the progress bar
+
+        # Configure the third column (where progress bars are) to expand when the window resizes
+        sensor_frame.grid_columnconfigure(2, weight=1)
+
+    def update_sensor_data(self, data):
+        """
+        Updates the sensor display with new data.
+        Iterates through the provided data, updates labels and progress bars,
+        and applies the correct color style based on the value.
+
+        Args:
+            data (dict): A dictionary where keys are sensor identifiers
+                         (e.g., "room_temp") and values are their measurements.
+        """
+        for key, value in data.items():
+            if key in self.progress_vars:
+                # Update the text label displaying the current value
+                self.sensor_labels[key].config(text=f"{value:.1f}") # Format to one decimal place
+
+                # Update the progress bar's value
+                self.progress_vars[key].set(value)
+
+                # Determine and apply the appropriate style (color) to the progress bar
+                self._set_progressbar_style(key, value)
+
+    def _set_progressbar_style(self, key, value):
+        """
+        Determines the appropriate progress bar style (color) based on the
+        sensor type and its current value, applying comfort level logic.
+
+        Args:
+            key (str): The identifier for the sensor (e.g., "room_temp").
+            value (float): The current measured value of the sensor.
+        """
+        style_name = "Horizontal.TProgressbar" # Default style if no specific condition met
+
+        if key == "room_temp":
+            # Room Temperature: Green (comfortable), Yellow (acceptable), Dark Blue (too cold), Red (too hot)
+            if 20 <= value <= 24:
+                style_name = "green.Horizontal.TProgressbar"
+            elif (18 <= value < 20) or (24 < value <= 26):
+                style_name = "yellow.Horizontal.TProgressbar"
+            elif value < 18:
+                style_name = "darkblue.Horizontal.TProgressbar"
+            else: # value > 26
+                style_name = "red.Horizontal.TProgressbar"
+        elif key == "co2_saturation":
+            # CO2 Saturation: Green (low), Yellow (open windows), Red (uncomfortable)
+            if value < 800:
+                style_name = "green.Horizontal.TProgressbar"
+            elif 800 <= value <= 1200:
+                style_name = "yellow.Horizontal.TProgressbar"
+            else: # value > 1200
+                style_name = "red.Horizontal.TProgressbar"
+        elif key == "o2neg_saturation":
+            # Negative O2 Ions: Green (beneficial), Yellow (acceptable), Red (low)
+            # Research suggests >1000 ions/cm³ is beneficial, 500-1000 acceptable, <500 low.
+            if value > 1000:
+                style_name = "green.Horizontal.TProgressbar"
+            elif 500 <= value <= 1000:
+                style_name = "yellow.Horizontal.TProgressbar"
+            else: # value < 500
+                style_name = "red.Horizontal.TProgressbar"
+        elif key == "humidity_percentage":
+            # Humidity: Green (convenient), Yellow (uncomfortable), Red (too dry/too high)
+            if 40 <= value <= 60:
+                style_name = "green.Horizontal.TProgressbar"
+            elif (30 <= value < 40) or (60 < value <= 70):
+                style_name = "yellow.Horizontal.TProgressbar"
+            else: # value < 30 or value > 70
+                style_name = "red.Horizontal.TProgressbar"
+
+        # Apply the determined style to the specific progress bar
+        self.progress_bars[key].config(style=style_name)
+
+    def _configure_styles(self):
+        """
+        Configures custom styles for ttk.Progressbar to allow dynamic coloring.
+        Each style defines the background color of the progress bar itself.
+        """
+        # Green style for comfortable conditions
+        self.style.configure("green.Horizontal.TProgressbar", troughcolor='lightgray', background='green')
+        # Yellow style for acceptable/warning conditions
+        self.style.configure("yellow.Horizontal.TProgressbar", troughcolor='lightgray', background='yellow')
+        # Red style for uncomfortable/critical conditions
+        self.style.configure("red.Horizontal.TProgressbar", troughcolor='lightgray', background='red')
+        # Dark blue style for too cold temperature
+        self.style.configure("darkblue.Horizontal.TProgressbar", troughcolor='lightgray', background='darkblue')
+
     
     def select_video_file(self):
         file_path = filedialog.askopenfilename(
@@ -592,7 +719,27 @@ def main():
     # Create and run application
     root = tk.Tk()
     app = MentalFatigueDetector(root)
+
+    # Function to simulate sensor data updates periodically
+    def simulate_data():
+        """Generates random sensor data and updates the dashboard."""
+        temp = random.uniform(15, 30) # Temperature between 15 and 30°C
+        co2 = random.uniform(400, 1500) # CO2 between 400 and 1500 ppm
+        o2neg = random.uniform(200, 1500) # O2- between 200 and 1500 ions/cm³
+        humidity = random.uniform(20, 80) # Humidity between 20 and 80%
+
+        data = {
+            "room_temp": temp,
+            "co2_saturation": co2,
+            "o2neg_saturation": o2neg,
+            "humidity_percentage": humidity
+        }
+        app.update_sensor_data(data)
+        # Schedule the next data simulation after 2000 milliseconds (2 seconds)
+        root.after(20000, simulate_data)
     
+    simulate_data()
+
     try:
         root.mainloop()
     except KeyboardInterrupt:
