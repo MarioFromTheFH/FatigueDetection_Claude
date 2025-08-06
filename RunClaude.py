@@ -227,8 +227,9 @@ class MentalFatigueDetector:
         """
         for key, value in data.items():
             if key in self.progress_vars:
-                # Update the text label displaying the current value
-                self.sensor_labels[key].config(text=f"{value:.1f}") # Format to one decimal place
+                # Update the text label displaying the current value with its unit
+                unit = self.sensor_units.get(key, "") # Get the unit, default to empty string if not found
+                self.sensor_labels[key].config(text=f"{value:.1f}{unit}") # Format to one decimal place and add unit
 
                 # Update the progress bar's value
                 self.progress_vars[key].set(value)
