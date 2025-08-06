@@ -80,6 +80,19 @@ class MentalFatigueDetector:
         self.sensor_labels = {}
         self.progress_vars = {}
         self.progress_bars = {}
+        self.sensor_units = { # Mapping of sensor keys to their units
+            "room_temp": " °C",
+            "co2_saturation": " ppm",
+            "o2neg_saturation": " ions/cm³",
+            "humidity_percentage": " %",
+        }
+        # Store initial base values for simulation fluctuation
+        self.base_sensor_values = {
+            "room_temp": 22.0,
+            "co2_saturation": 700.0,
+            "o2neg_saturation": 1200.0,
+            "humidity_percentage": 50.0,
+        }
         
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
@@ -175,7 +188,7 @@ class MentalFatigueDetector:
         sensor_frame = ttk.LabelFrame(info_frame, text="Sensor Data", padding="5")
         sensor_frame.pack(fill=tk.X, pady=(10, 0))
 
-        # Define sensor items with their display labels, data keys, and maximum values for progress bars
+         # Define sensor items with their display labels, data keys, and maximum values for progress bars
         sensor_items = [
             ("Temperature", "room_temp", 30), # Max value for temperature (e.g., up to 30°C)
             ("CO₂", "co2_saturation", 2000), # Max value for CO2 (e.g., up to 2000 ppm)
@@ -719,26 +732,6 @@ def main():
     # Create and run application
     root = tk.Tk()
     app = MentalFatigueDetector(root)
-
-    # Function to simulate sensor data updates periodically
-    def simulate_data():
-        """Generates random sensor data and updates the dashboard."""
-        temp = random.uniform(15, 30) # Temperature between 15 and 30°C
-        co2 = random.uniform(400, 1500) # CO2 between 400 and 1500 ppm
-        o2neg = random.uniform(200, 1500) # O2- between 200 and 1500 ions/cm³
-        humidity = random.uniform(20, 80) # Humidity between 20 and 80%
-
-        data = {
-            "room_temp": temp,
-            "co2_saturation": co2,
-            "o2neg_saturation": o2neg,
-            "humidity_percentage": humidity
-        }
-        app.update_sensor_data(data)
-        # Schedule the next data simulation after 2000 milliseconds (2 seconds)
-        root.after(20000, simulate_data)
-    
-    simulate_data()
 
     try:
         root.mainloop()
