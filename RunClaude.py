@@ -733,6 +733,44 @@ def main():
     root = tk.Tk()
     app = MentalFatigueDetector(root)
 
+    # Function to simulate sensor data updates periodically
+    def simulate_data():
+        """
+        Generates random sensor data within a narrow fluctuation range
+        and updates the dashboard.
+        """
+        new_data = {}
+        fluctuation_percentage = 0.05 # +/- 5% fluctuation
+
+        for key, base_value in app.base_sensor_values.items():
+            # Calculate min and max for fluctuation
+            min_val = base_value * (1 - fluctuation_percentage)
+            max_val = base_value * (1 + fluctuation_percentage)
+
+            # Ensure values stay within reasonable overall bounds
+            if key == "room_temp":
+                min_val = max(min_val, 15)
+                max_val = min(max_val, 30)
+            elif key == "co2_saturation":
+                min_val = max(min_val, 400)
+                max_val = min(max_val, 2000)
+            elif key == "o2neg_saturation":
+                min_val = max(min_val, 200)
+                max_val = min(max_val, 2000)
+            elif key == "humidity_percentage":
+                min_val = max(min_val, 0)
+                max_val = min(max_val, 100)
+
+            # Generate new value within the fluctuating range
+            new_data[key] = random.uniform(min_val, max_val)
+
+        app.update_sensor_data(new_data)
+        # Schedule the next data simulation after 2000 milliseconds (2 seconds)
+        root.after(2000, simulate_data)
+
+    # Start the data simulation
+    simulate_data()
+
     try:
         root.mainloop()
     except KeyboardInterrupt:
